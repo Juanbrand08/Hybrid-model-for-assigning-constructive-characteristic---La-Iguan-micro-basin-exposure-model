@@ -1,0 +1,354 @@
+import pandas as pd
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+from geopy.distance import geodesic
+import warnings
+warnings.filterwarnings('ignore')
+
+# PARÁMETROS DE CONFIGURACIÓN
+CONFIG = {
+    'LIMITE_MAMPOSTERIA_NR': 4,
+    'LIMITE_MAMPOSTERIA_CONF': 5,
+    'ALTURA_PAJARITO_MUROS': 5,
+    'RADIO_CONFIANZA_KM': 3.0,
+    'USAR_ESTRATO': True,
+    'PESO_POR_AREA': True
+}
+
+def cargar_y_limpiar_datos():
+    """Carga datos y elimina registros no deseados"""
+    print("=== CARGANDO Y LIMPIANDO DATOS ===")
+    
+    # Cargar archivos
+    encuesta = pd.read_csv('encuesta_taxonomia_prc.csv')  #####
+    catastro = pd.read_csv('centroides_catastro_limpio.csv')  #####archivo resultante del preprocesamiento de la data de catastro de la ciudad
+    encuesta_gsv = pd.read_csv('Encuesta_gsv_microcuenca.csv')  #####modelo de exposición de x + encuestas levantadas mediante google street view
+    
+    # Eliminar Facultad de Minas del catastro
+    antes = len(catastro)
+    catastro = catastro[catastro['nombre'] != 'Facultad de Minas']
+    eliminados = antes - len(catastro)
+    print(f"Eliminados {eliminados} registros de 'Facultad de Minas'")
+    
+    # Cargar asignaciones manuales
+    try:
+        df_manual = pd.read_excel('asignaciones_manuales.xlsx')
+        eliminaciones, asignaciones = procesar_asignaciones_manuales(df_manual)
+    except FileNotFoundError:
+        print("No se encontró archivo de asignaciones manuales")
+        eliminaciones, asignaciones = [], []
+    
+    print(f"Datos cargados - Encuesta: {len(encuesta)}, Catastro: {len(catastro)}, GSV: {len(encuesta_gsv)}")
+    return encuesta, catastro, encuesta_gsv, eliminaciones, asignaciones
+
+def procesar_asignaciones_manuales(df_manual):
+    """Procesa asignaciones manuales del Excel"""
+    if df_manual.columns[0] in ['Unnamed: 0', '__EMPTY']:
+        df_manual = df_manual.rename(columns={df_manual.columns[0]: 'tipo_id'})
+    
+    eliminaciones, asignaciones = [], []
+    tipos_construccion = ['Mampostería no reforzada', 'Mampostería confinada', 
+                         'Muros de concreto reforzado', 'Pórticos de concreto', 'Sistema dual']
+    
+    for _, row in df_manual.iterrows():
+        if pd.notna(row.get('eliminar')):
+            eliminaciones.append({'tipo_id': row['tipo_id'], 'id_valor': str(row['eliminar'])})
+        
+        if pd.notna(row.get('asignar')):
+            tipo_asignado = next((tipo for tipo in tipos_construccion if row.get(tipo) == 1), None)
+            if tipo_asignado:
+                asignaciones.append({
+                    'tipo_id': row['tipo_id'], 'id_valor': str(row['asignar']), 
+                    'tipo_construccion': tipo_asignado
+                })
+    
+    return eliminaciones, asignaciones
+
+def aplicar_eliminaciones_manuales(catastro, eliminaciones):
+    """Aplica eliminaciones manuales"""
+    eliminados_count = 0
+    for elim in eliminaciones:
+        if elim['tipo_id'] == 'id_constru':
+            mask = catastro['id_constru'] == elim['id_valor']
+        elif elim['tipo_id'] == 'cbml':
+            mask = catastro['cbml'] == int(elim['id_valor']) if elim['id_valor'].isdigit() else catastro['cbml'].astype(str) == elim['id_valor']
+        elif elim['tipo_id'] == 'cobama':
+            mask = catastro['cobama'] == int(elim['id_valor']) if elim['id_valor'].isdigit() else catastro['cobama'].astype(str) == elim['id_valor']
+        else:
+            continue
+        
+        eliminados_count += mask.sum()
+        catastro = catastro[~mask]
+    
+    print(f"Eliminaciones manuales aplicadas: {eliminados_count}")
+    return catastro
+
+def aplicar_asignaciones_manuales(catastro, asignaciones):
+    """Aplica asignaciones manuales"""
+    catastro['tipo_construccion_asignado'] = None
+    catastro['metodo_asignacion'] = None
+    catastro['distancia_punto_cercano'] = None
+    
+    asignados_count = 0
+    for asig in asignaciones:
+        if asig['tipo_id'] == 'id_constru':
+            mask = catastro['id_constru'] == asig['id_valor']
+        elif asig['tipo_id'] == 'cbml':
+            mask = catastro['cbml'] == int(asig['id_valor']) if asig['id_valor'].isdigit() else catastro['cbml'].astype(str) == asig['id_valor']
+        elif asig['tipo_id'] == 'cobama':
+            mask = catastro['cobama'] == int(asig['id_valor']) if asig['id_valor'].isdigit() else catastro['cobama'].astype(str) == asig['id_valor']
+        else:
+            continue
+        
+        if mask.sum() > 0:
+            catastro.loc[mask, 'tipo_construccion_asignado'] = asig['tipo_construccion']
+            catastro.loc[mask, 'metodo_asignacion'] = 'asignacion_manual'
+            asignados_count += mask.sum()
+    
+    print(f"Asignaciones manuales aplicadas: {asignados_count}")
+    return catastro
+
+def encontrar_punto_mas_cercano_mejorado(coords_objetivo, coords_ref, tipos_ref, estratos_ref=None, areas_ref=None, 
+                                        estrato_objetivo=None, area_objetivo=None):
+    """Algoritmo mejorado de punto más cercano con estratos y área"""
+    
+    # Filtrar por estrato si está disponible y configurado
+    if CONFIG['USAR_ESTRATO'] and estrato_objetivo is not None and estratos_ref is not None:
+        # Buscar primero en mismo estrato
+        mask_estrato = estratos_ref == estrato_objetivo
+        if mask_estrato.sum() > 5:  # Suficientes datos
+            coords_filtradas = coords_ref[mask_estrato]
+            tipos_filtrados = tipos_ref[mask_estrato]
+            areas_filtradas = areas_ref[mask_estrato] if areas_ref is not None else None
+        else:
+            # Buscar en estratos similares (±1)
+            estratos_similares = [estrato_objetivo-1, estrato_objetivo, estrato_objetivo+1]
+            mask_estrato = np.isin(estratos_ref, estratos_similares)
+            coords_filtradas = coords_ref[mask_estrato]
+            tipos_filtrados = tipos_ref[mask_estrato]
+            areas_filtradas = areas_ref[mask_estrato] if areas_ref is not None else None
+    else:
+        coords_filtradas = coords_ref
+        tipos_filtrados = tipos_ref
+        areas_filtradas = areas_ref
+    
+    # Calcular distancias usando Haversine
+    distancias = [geodesic(coords_objetivo, coord).kilometers for coord in coords_filtradas]
+    
+    if len(distancias) == 0:
+        return None, None, np.inf
+    
+    # Aplicar peso por área si está configurado
+    if CONFIG['PESO_POR_AREA'] and area_objetivo is not None and areas_filtradas is not None:
+        pesos_area = []
+        for area_ref in areas_filtradas:
+            if pd.notna(area_ref) and area_ref > 0:
+                ratio = min(area_objetivo, area_ref) / max(area_objetivo, area_ref)
+                pesos_area.append(ratio)
+            else:
+                pesos_area.append(0.5)  # Peso neutral si no hay datos
+        
+        # Combinar distancia y área (distancia ponderada por área)
+        distancias_ponderadas = [d / (1 + peso) for d, peso in zip(distancias, pesos_area)]
+        indice_min = np.argmin(distancias_ponderadas)
+    else:
+        indice_min = np.argmin(distancias)
+    
+    return tipos_filtrados[indice_min], indice_min, distancias[indice_min]
+
+def asignar_tipos_automatico(catastro, encuesta, encuesta_gsv):
+    """Asignación automática mejorada"""
+    print("\n=== ASIGNACIÓN AUTOMÁTICA MEJORADA ===")
+    
+    # Preparar datos de referencia
+    encuesta_coords = encuesta[['lat', 'lon']].values
+    encuesta_tipos = encuesta['tipo_construccion'].values
+    encuesta_estratos = encuesta['estrato'].values if 'estrato' in encuesta.columns else None
+    encuesta_areas = encuesta['area_construida'].values if 'area_construida' in encuesta.columns else None
+    
+    gsv_coords = encuesta_gsv[['lat', 'long']].values
+    gsv_tipos = encuesta_gsv['tipo_construccion'].values
+    
+    # Separar zonas GSV
+    gsv_urbana = encuesta_gsv[encuesta_gsv['nombre'] == 'Zona urbana']
+    gsv_rural = encuesta_gsv[encuesta_gsv['nombre'] == 'Zona rural']
+    
+    barrios_encuesta = set(encuesta['nombre'].unique())
+    registros_procesados = 0
+    
+    # Procesar registros sin asignación
+    for idx, row in catastro.iterrows():
+        if pd.notna(row['tipo_construccion_asignado']):
+            continue  # Ya tiene asignación
+        
+        barrio = row['nombre']
+        coords = (row['lat'], row['lon'])
+        num_pis = row['num_pis']
+        estrato = row.get('estrato')
+        area = row.get('area_cons_total')
+        
+        tipo_asignado, metodo, distancia = None, None, None
+        
+        # REGLAS ESPECIALES POR BARRIO
+        if barrio in ['Pajarito', 'SC - Área de Expansión Pajarito']:
+            if num_pis >= CONFIG['ALTURA_PAJARITO_MUROS']:
+                tipo_asignado, metodo = 'Muros de concreto reforzado', 'regla_pajarito_alto'
+            else:
+                # Buscar en encuesta excluyendo Pajarito
+                encuesta_sin_pajarito = encuesta[~encuesta['nombre'].str.contains('Pajarito', na=False)]
+                if len(encuesta_sin_pajarito) > 0:
+                    coords_sin_paj = encuesta_sin_pajarito[['lat', 'lon']].values
+                    tipos_sin_paj = encuesta_sin_pajarito['tipo_construccion'].values
+                    tipo_asignado, _, distancia = encontrar_punto_mas_cercano_mejorado(
+                        coords, coords_sin_paj, tipos_sin_paj)
+                    metodo = 'regla_pajarito_bajo_cercano'
+        
+        elif barrio == 'SC - La Loma':
+            # Usar proporción de Olaya Herrera
+            olaya_tipos = encuesta[encuesta['nombre'] == 'Olaya Herrera']['tipo_construccion'].value_counts()
+            if len(olaya_tipos) > 0:
+                proporcion = olaya_tipos / olaya_tipos.sum()
+                tipo_asignado = np.random.choice(proporcion.index, p=proporcion.values)
+                metodo = 'regla_loma_proporcion_olaya'
+        
+        elif barrio == 'SC - Cabecera Urbana Corregimiento San Cristóbal':
+            # Usar zona urbana GSV
+            if len(gsv_urbana) > 0:
+                tipos_urbana = gsv_urbana['tipo_construccion'].value_counts()
+                proporcion = tipos_urbana / tipos_urbana.sum()
+                tipo_asignado = np.random.choice(proporcion.index, p=proporcion.values)
+                metodo = 'gsv_zona_urbana_proporcion'
+        
+        elif barrio.startswith('SC -'):
+            # Usar zona rural GSV
+            if len(gsv_rural) > 0:
+                coords_rural = gsv_rural[['lat', 'long']].values
+                tipos_rural = gsv_rural['tipo_construccion'].values
+                tipo_asignado, _, distancia = encontrar_punto_mas_cercano_mejorado(
+                    coords, coords_rural, tipos_rural)
+                metodo = 'gsv_zona_rural_punto_cercano'
+        
+        elif barrio in barrios_encuesta:
+            # Usar encuesta principal con algoritmo mejorado
+            tipo_asignado, _, distancia = encontrar_punto_mas_cercano_mejorado(
+                coords, encuesta_coords, encuesta_tipos, encuesta_estratos, encuesta_areas, estrato, area)
+            
+            # Verificar radio de confianza
+            if distancia and distancia > CONFIG['RADIO_CONFIANZA_KM']:
+                # Usar proporción general si está muy lejos
+                tipos_generales = encuesta['tipo_construccion'].value_counts()
+                proporcion = tipos_generales / tipos_generales.sum()
+                tipo_asignado = np.random.choice(proporcion.index, p=proporcion.values)
+                metodo = 'proporcion_por_distancia_excesiva'
+            else:
+                metodo = 'punto_cercano_mejorado'
+        
+        # Asignar resultados
+        if tipo_asignado:
+            catastro.loc[idx, 'tipo_construccion_asignado'] = tipo_asignado
+            catastro.loc[idx, 'metodo_asignacion'] = metodo
+            if distancia:
+                catastro.loc[idx, 'distancia_punto_cercano'] = distancia
+            registros_procesados += 1
+    
+    print(f"Registros procesados automáticamente: {registros_procesados}")
+    return catastro
+
+def aplicar_restricciones_altura(catastro):
+    """Aplica restricciones de altura"""
+    print("\n=== APLICANDO RESTRICCIONES DE ALTURA ===")
+    
+    correcciones = 0
+    
+    # Mampostería no reforzada > 4 pisos
+    mask_nr = (catastro['tipo_construccion_asignado'] == 'Mampostería no reforzada') & \
+              (catastro['num_pis'] > CONFIG['LIMITE_MAMPOSTERIA_NR'])
+    
+    catastro.loc[mask_nr, 'tipo_construccion_asignado'] = 'Pórticos de concreto'
+    catastro.loc[mask_nr, 'metodo_asignacion'] = 'correccion_altura_mamposteria_nr'
+    correcciones += mask_nr.sum()
+    
+    # Mampostería confinada > 5 pisos
+    mask_conf = (catastro['tipo_construccion_asignado'] == 'Mampostería confinada') & \
+                (catastro['num_pis'] > CONFIG['LIMITE_MAMPOSTERIA_CONF'])
+    
+    catastro.loc[mask_conf, 'tipo_construccion_asignado'] = 'Pórticos de concreto'
+    catastro.loc[mask_conf, 'metodo_asignacion'] = 'correccion_altura_mamposteria_conf'
+    correcciones += mask_conf.sum()
+    
+    print(f"Correcciones por altura aplicadas: {correcciones}")
+    return catastro
+
+def generar_estadisticas_finales(catastro):
+    """Genera estadísticas finales"""
+    print(f"\n=== ESTADÍSTICAS FINALES ===")
+    
+    total = len(catastro)
+    con_asignacion = catastro['tipo_construccion_asignado'].notna().sum()
+    
+    print(f"Total registros: {total:,}")
+    print(f"Con asignación: {con_asignacion:,} ({con_asignacion/total*100:.1f}%)")
+    print(f"Sin asignación: {total-con_asignacion:,}")
+    
+    # Distribución por método
+    print(f"\nMétodos de asignación:")
+    metodos = catastro['metodo_asignacion'].value_counts()
+    for metodo, count in metodos.items():
+        print(f"  {metodo}: {count:,}")
+    
+    # Distribución de tipos
+    print(f"\nTipos de construcción:")
+    tipos = catastro['tipo_construccion_asignado'].value_counts()
+    for tipo, count in tipos.items():
+        pct = count / con_asignacion * 100
+        print(f"  {tipo}: {count:,} ({pct:.1f}%)")
+    
+    # Verificación de restricciones
+    violaciones_nr = catastro[
+        (catastro['tipo_construccion_asignado'] == 'Mampostería no reforzada') & 
+        (catastro['num_pis'] > CONFIG['LIMITE_MAMPOSTERIA_NR'])
+    ]
+    
+    violaciones_conf = catastro[
+        (catastro['tipo_construccion_asignado'] == 'Mampostería confinada') & 
+        (catastro['num_pis'] > CONFIG['LIMITE_MAMPOSTERIA_CONF'])
+    ]
+    
+    print(f"\nVerificación de restricciones:")
+    print(f"  Violaciones mampostería NR: {len(violaciones_nr)} (debería ser 0)")
+    print(f"  Violaciones mampostería confinada: {len(violaciones_conf)} (debería ser 0)")
+
+def sistema_completo_mejorado():
+    """Sistema completo mejorado y conciso"""
+    print("SISTEMA COMPLETO MEJORADO DE ASIGNACIÓN DE TIPOS DE CONSTRUCCIÓN")
+    print("="*80)
+    print(f"Configuración: {CONFIG}")
+    
+    # 1. Cargar y limpiar datos
+    encuesta, catastro, encuesta_gsv, eliminaciones, asignaciones = cargar_y_limpiar_datos()
+    
+    # 2. Aplicar eliminaciones y asignaciones manuales
+    catastro = aplicar_eliminaciones_manuales(catastro, eliminaciones)
+    catastro = aplicar_asignaciones_manuales(catastro, asignaciones)
+    
+    # 3. Asignación automática mejorada
+    np.random.seed(42)  # Reproducibilidad
+    catastro = asignar_tipos_automatico(catastro, encuesta, encuesta_gsv)
+    
+    # 4. Aplicar restricciones de altura
+    catastro = aplicar_restricciones_altura(catastro)
+    
+    # 5. Generar estadísticas y guardar
+    generar_estadisticas_finales(catastro)
+    
+    # Guardar resultado
+    archivo_salida = 'catastro_mejorado_final.csv'
+    catastro.to_csv(archivo_salida, index=False)
+    print(f"\nArchivo guardado: {archivo_salida}")
+    
+    return catastro
+
+# Ejecutar sistema
+if __name__ == "__main__":
+    resultado = sistema_completo_mejorado()
+    print(f"\nPROCESAMIENTO COMPLETADO EXITOSAMENTE!")
